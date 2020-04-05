@@ -48,8 +48,8 @@ namespace eosio { namespace chain {
 
 
    struct block_log_preamble {
-      uint32_t version;
-      uint32_t first_block_num;
+      uint32_t version         = 0;
+      uint32_t first_block_num = 0;
       chain_id_type id;
 
       template <typename Stream>
@@ -124,10 +124,9 @@ namespace eosio { namespace chain {
          return result;
       }
 
-      template <typename Stream,
-                class = typename std::enable_if<!std::is_lvalue_reference<Stream>::value>::type>
-      void read_and_ignore_context(Stream&& ds) {
-         this->read(std::move(ds), [](auto&& ds, const block_log_preamble& preamble) {});
+      template <typename Stream>
+      void read_and_ignore_context(Stream& ds) {
+         this->read(ds, [](auto&& ds, const block_log_preamble& preamble) {});
       }
    };
 
@@ -196,13 +195,12 @@ namespace eosio { namespace chain {
 
       class block_log_impl {
          public:
-            pruned_block_ptr head;
-            fc::cfile        block_file;
-            fc::cfile        index_file;
-            bool             open_files                   = false;
-            bool             genesis_written_to_block_log = false;
-            uint32_t         version                      = 0;
-            uint32_t         first_block_num              = 0;
+            pruned_block_ptr   head;
+            fc::cfile          block_file;
+            fc::cfile          index_file;
+            bool               open_files                   = false;
+            bool               genesis_written_to_block_log = false;
+            block_log_preamble preamble;
 
             inline void check_open_files() {
                if( !open_files ) {
@@ -276,13 +274,11 @@ namespace eosio { namespace chain {
 
       class reverse_iterator {
       public:
-         reverse_iterator();
          // open a block log file and return the total number of blocks in it
          uint32_t open(const fc::path& block_file_name);
          uint64_t previous();
          uint32_t version() const { return _preamble.version; }
          uint32_t first_block_num() const { return _preamble.first_block_num; }
-         constexpr static uint32_t      _buf_len                          = 1U << 24;
       private:
          boost::iostreams::mapped_file_source _log;
          block_log_preamble                   _preamble;
@@ -410,23 +406,9 @@ namespace eosio { namespace chain {
       if (log_size) {
          ilog("Log is nonempty");
          my->block_file.seek( 0 );
-         my->version = 0;
-         my->block_file.read( (char*)&my->version, sizeof(my->version) );
-         EOS_ASSERT( my->version > 0, block_log_exception, "Block log was not setup properly" );
-         EOS_ASSERT( is_supported_version(my->version), block_log_unsupported_version,
-                     "Unsupported version of block log. Block log version is ${version} while code supports version(s) [${min},${max}]",
-                     ("version", my->version)("min", block_log::min_supported_version)("max", block_log::max_supported_version) );
-
+         my->preamble.read_and_ignore_context(my->block_file);
 
          my->genesis_written_to_block_log = true; // Assume it was constructed properly.
-         if (my->version > 1){
-            my->first_block_num = 0;
-            my->block_file.read( (char*)&my->first_block_num, sizeof(my->first_block_num) );
-            EOS_ASSERT(my->first_block_num > 0, block_log_exception, "Block log is malformed, first recorded block number is 0 but must be greater than or equal to 1");
-         } else {
-            my->first_block_num = 1;
-         }
-
          my->read_head();
 
          if (index_size) {
@@ -462,7 +444,7 @@ namespace eosio { namespace chain {
       uint64_t pos = block_file.tellp();
       std::vector<char> buffer;
      
-      if (version >= 4)  {
+      if (preamble.version >= 4)  {
          buffer = detail::pack(b, segment_compression);
       } else {
 #warning: TODO avoid heap allocation
@@ -494,11 +476,11 @@ namespace eosio { namespace chain {
 
          block_file.seek_end(0);
          index_file.seek_end(0);
-         EOS_ASSERT(index_file.tellp() == sizeof(uint64_t) * (b->block_num() - first_block_num),
+         EOS_ASSERT(index_file.tellp() == sizeof(uint64_t) * (b->block_num() - preamble.first_block_num),
                    block_log_append_fail,
                    "Append to index file occuring at wrong position.",
                    ("position", (uint64_t) index_file.tellp())
-                   ("expected", (b->block_num() - first_block_num) * sizeof(uint64_t)));
+                   ("expected", (b->block_num() - preamble.first_block_num) * sizeof(uint64_t)));
 
          auto pos = write_log_entry(*b, segment_compression);
 
@@ -529,12 +511,12 @@ namespace eosio { namespace chain {
 
       reopen();
 
-      version = 0; // version of 0 is invalid; it indicates that subsequent data was not properly written to the block log
-      first_block_num = first_bnum;
+      preamble.version = 0; // version of 0 is invalid; it indicates that subsequent data was not properly written to the block log
+      preamble.first_block_num = first_bnum;
 
       block_file.seek_end(0);
-      block_file.write((char*)&version, sizeof(version));
-      block_file.write((char*)&first_block_num, sizeof(first_block_num));
+      block_file.write((char*)&preamble.version, sizeof(preamble.version));
+      block_file.write((char*)&preamble.first_block_num, sizeof(preamble.first_block_num));
 
       write(t);
       genesis_written_to_block_log = true;
@@ -544,7 +526,7 @@ namespace eosio { namespace chain {
       block_file.write((char*)&totem, sizeof(totem));
 
       // version must be assigned before this->append() because it is used inside this->append()
-      version = block_log::max_supported_version;
+      preamble.version = block_log::max_supported_version;
 
       if (first_block) {
          append(first_block, segment_compression);
@@ -558,7 +540,7 @@ namespace eosio { namespace chain {
 
       // going back to write correct version to indicate that all block log header data writes completed successfully
       block_file.seek( 0 );
-      block_file.write( (char*)&version, sizeof(version) );
+      block_file.write( (char*)&preamble.version, sizeof(preamble.version) );
       block_file.seek( pos );
       flush();
    }
@@ -590,7 +572,7 @@ namespace eosio { namespace chain {
    std::unique_ptr<pruned_block> detail::block_log_impl::read_block(uint64_t pos) {
       block_file.seek(pos);
       auto ds = block_file.create_datastream();
-      if (version >= 4) {
+      if (preamble.version >= 4) {
          auto entry = std::make_unique<log_entry_v4>();
          unpack(ds, *entry);
          return entry;
@@ -605,7 +587,7 @@ namespace eosio { namespace chain {
       block_file.seek(pos);
       auto ds = block_file.create_datastream();
 
-      if (version >= 4 ) {
+      if (preamble.version >= 4 ) {
          uint32_t offset;
          uint8_t  compression;
          fc::raw::unpack(ds, offset);
@@ -649,9 +631,9 @@ namespace eosio { namespace chain {
 
    uint64_t block_log::get_block_pos(uint32_t block_num) const {
       my->check_open_files();
-      if (!(my->head && block_num <= my->head->block_num() && block_num >= my->first_block_num))
+      if (!(my->head && block_num <= my->head->block_num() && block_num >= my->preamble.first_block_num))
          return npos;
-      my->index_file.seek(sizeof(uint64_t) * (block_num - my->first_block_num));
+      my->index_file.seek(sizeof(uint64_t) * (block_num - my->preamble.first_block_num));
       uint64_t pos;
       my->index_file.read((char*)&pos, sizeof(pos));
       return pos;
@@ -677,7 +659,7 @@ namespace eosio { namespace chain {
    }
 
    uint32_t block_log::first_block_num() const {
-      return my->first_block_num;
+      return my->preamble.first_block_num;
    }
 
    void block_log::construct_index() {
@@ -892,7 +874,7 @@ namespace eosio { namespace chain {
    
    void block_log::prune_transactions(uint32_t block_num, const std::vector<transaction_id_type>& ids) {
       try {
-         EOS_ASSERT(my->version >= 4, block_log_exception, "The block log version ${version} does not support transaction pruning.", ("version", my->version));
+         EOS_ASSERT(my->preamble.version >= 4, block_log_exception, "The block log version ${version} does not support transaction pruning.", ("version", my->preamble.version));
          uint64_t pos = get_block_pos(block_num);
          EOS_ASSERT(pos != npos, block_log_exception,
                      "Specified block_num ${block_num} does not exist in block log.", ("block_num", block_num));
@@ -924,14 +906,11 @@ namespace eosio { namespace chain {
       FC_LOG_AND_RETHROW()
    }
 
-   
-   detail::reverse_iterator::reverse_iterator() {
-   }
-
    uint32_t detail::reverse_iterator::open(const fc::path& block_file_name) {
       _block_file_name = block_file_name.generic_string();
       _log.open(_block_file_name);
-      _preamble.read_and_ignore_context(fc::datastream<const char*>(_log.data(), _log.size()));
+      fc::datastream<const char*> ds(_log.data(), _log.size());
+      _preamble.read_and_ignore_context(ds);
 
       _blocks_found = 0;
       _current_position_in_file = _log.size() - sizeof(uint64_t);
@@ -1066,7 +1045,6 @@ namespace eosio { namespace chain {
 
    struct trim_data {            //used by trim_blocklog_front(), trim_blocklog_end(), and smoke_test()
       trim_data(fc::path block_dir);
-      ~trim_data();
       uint64_t block_index(uint32_t n) const;
       uint64_t block_pos(uint32_t n);
 
@@ -1158,9 +1136,10 @@ namespace eosio { namespace chain {
          // of the block start and store in the new index file
          while(original_pos >= start_of_blk_buffer_pos) {
             const auto buffer_index = original_pos - start_of_blk_buffer_pos;
-            uint64_t& pos_content = *(uint64_t*)(buf + buffer_index);
+            uint64_t pos_content = read_buffer<uint64_t>(buf + buffer_index);
             const auto start_of_this_block = pos_content;
             pos_content = start_of_this_block - pos_delta;
+            memcpy(buf + buffer_index, &pos_content, sizeof(pos_content));
             index.write(pos_content);
             original_pos = start_of_this_block - pos_size;
          }
@@ -1206,9 +1185,6 @@ namespace eosio { namespace chain {
                  ("file", block_file_name.string())("determined", start_of_blocks)("index",first_block_pos));
       ilog("first block= ${first}",("first",preamble.first_block_num));
       ilog("last block= ${last}",("last",last_block));
-   }
-
-   trim_data::~trim_data() {
    }
 
    uint64_t trim_data::block_index(uint32_t n) const {
