@@ -38,6 +38,14 @@ namespace eosio { namespace chain {
     */
    const uint32_t block_log::max_supported_version = 4;
 
+
+   template <typename T>
+   T read_buffer(const char* buf) {
+      T result;
+      memcpy(&result, buf, sizeof(T));
+      return result;
+   }
+
    namespace detail {
       using unique_file = std::unique_ptr<FILE, decltype(&fclose)>;
 
@@ -137,9 +145,6 @@ namespace eosio { namespace chain {
 
             uint64_t append(const pruned_block_ptr& b, pruned_transaction::cf_compression_type segment_compression);
 
-            template <typename ChainContext, typename Lambda>
-            static fc::optional<ChainContext> extract_chain_context( const fc::path& data_dir, Lambda&& lambda );
-
             uint64_t write_log_entry(const pruned_block&                     b,
                                      pruned_transaction::cf_compression_type segment_compression);
 
@@ -160,6 +165,11 @@ namespace eosio { namespace chain {
                int blknum_offset = 14;
                blknum_offset += detail::offset_to_block_start(block_log_version);
                return blknum_offset;
+            }
+
+            static uint32_t block_num_for_entry_at(const char* addr, uint32_t version) { 
+               uint32_t prev_block_num = read_buffer<uint32_t>(addr + blknum_offset_from_block_entry(version));
+               return fc::endian_reverse_u32(prev_block_num) + 1;
             }
       };
 
@@ -269,6 +279,90 @@ namespace eosio { namespace chain {
 FC_REFLECT_DERIVED(eosio::chain::detail::log_entry_v4, (eosio::chain::pruned_block), (compression)(offset) )
 
 namespace eosio { namespace chain {
+
+   struct block_log_preamble {
+      uint32_t version;
+      uint32_t first_block_num;
+      chain_id_type id;
+
+      template <typename Stream>
+      void validate_totem(Stream& ds) const {
+         if (version != 1) {
+            auto                                    expected_totem = block_log::npos;
+            std::decay_t<decltype(block_log::npos)> actual_totem;
+            ds.read((char*)&actual_totem, sizeof(actual_totem));
+
+            EOS_ASSERT(
+                actual_totem == expected_totem, block_log_exception,
+                "Expected separator between block log header and blocks was not found( expected: ${e}, actual: ${a} )",
+                ("e", fc::to_hex((char*)&expected_totem, sizeof(expected_totem)))(
+                    "a", fc::to_hex((char*)&actual_totem, sizeof(actual_totem))));
+         }
+      }
+
+      template <typename Stream>
+      chain_id_type extract_chain_id(Stream& ds) const {
+         chain_id_type chain_id;
+         if (block_log::contains_genesis_state(version, first_block_num)) {
+            genesis_state state;
+            fc::raw::unpack(ds, state);
+            chain_id = state.compute_chain_id();
+         } else if (block_log::contains_chain_id(version, first_block_num)) {
+            ds >> chain_id;
+         } else {
+            EOS_THROW(block_log_exception,
+                      "Block log is not supported. version: ${ver} and first_block_num: ${fbn} does not contain "
+                      "a genesis_state nor a chain_id.",
+                      ("ver", version)("fbn", first_block_num));
+         }
+
+         validate_totem(ds);
+         return chain_id;
+      }
+
+      template <typename Stream, typename ContextExtractor>
+      void read(Stream&& ds, ContextExtractor&& extractor) {
+
+         ds.read((char*)&version, sizeof(version));
+         EOS_ASSERT(version > 0, block_log_exception, "Block log was not setup properly");
+         EOS_ASSERT(
+             block_log::is_supported_version(version), block_log_unsupported_version,
+             "Unsupported version of block log. Block log version is ${version} while code supports version(s) "
+             "[${min},${max}]",
+             ("version", version)("min", block_log::min_supported_version)("max", block_log::max_supported_version));
+
+         first_block_num = 1;
+         if (version != 1) {
+            ds.read((char*)&first_block_num, sizeof(first_block_num));
+         }
+
+         extractor(std::forward<Stream>(ds), *this);
+      }
+
+      template <typename Stream>
+      void read(Stream& ds) {
+         this->read(ds, [](auto& ds, block_log_preamble& preamble) { preamble.id = preamble.extract_chain_id(ds); });
+      }
+
+      fc::optional<genesis_state> extract_genesis_state(fc::datastream<const char*>&& ds) { 
+         fc::optional<genesis_state> result;
+         this->read(std::move(ds), [&result](auto&& ds, const block_log_preamble& preamble) {
+            if (block_log::contains_genesis_state(preamble.version, preamble.first_block_num)) {
+               genesis_state state;
+               fc::raw::unpack(ds, state);
+               preamble.validate_totem(ds);
+               result = state;
+            }
+          });
+         return result;
+      }
+
+      template <typename Stream,
+                class = typename std::enable_if<!std::is_lvalue_reference<Stream>::value>::type>
+      void read_and_ignore_context(Stream&& ds) {
+         this->read(std::move(ds), [](auto&& ds, const block_log_preamble& preamble) {});
+      }
+   };
 
    block_log::block_log(const fc::path& data_dir)
    :my(new detail::block_log_impl()) {
@@ -633,257 +727,168 @@ namespace eosio { namespace chain {
       index.complete();
    }
 
+
+   static bool verify_block(fc::datastream<const char*>& ds, block_id_type previous, uint64_t pos, const block_header& header) {
+      auto id = header.id();
+      if (block_header::num_from_id(previous) + 1 != block_header::num_from_id(id)) {
+         elog("Block ${num} (${id}) skips blocks. Previous block in block log is block ${prev_num} (${previous})",
+              ("num", block_header::num_from_id(id))("id", id)("prev_num", block_header::num_from_id(previous))(
+                  "previous", previous));
+      }
+      if (previous != header.previous) {
+         elog("Block ${num} (${id}) does not link back to previous block. "
+              "Expected previous: ${expected}. Actual previous: ${actual}.",
+              ("num", block_header::num_from_id(id))("id", id)("expected", previous)("actual", header.previous));
+      }
+
+      uint64_t tmp_pos = std::numeric_limits<uint64_t>::max();
+      if (ds.remaining() >= sizeof(tmp_pos)) {
+         ds.read(reinterpret_cast<char*>(&tmp_pos), sizeof(tmp_pos));
+      }
+      if (pos != tmp_pos) {
+         return false;
+      }
+      return true;
+   }
+
+   static void write_incomplete_block_data(const fc::path& blocks_dir, fc::time_point now, uint32_t block_num, const char* start, int size) {
+      auto tail_path = blocks_dir / std::string("blocks-bad-tail-").append(now).append(".log");
+      if (!fc::exists(tail_path)) {
+         std::fstream tail_stream;
+         tail_stream.open(tail_path.generic_string().c_str(), LOG_WRITE);
+         tail_stream.write(start, size);
+
+         ilog("Data at tail end of block log which should contain the (incomplete) serialization of block ${num} "
+              "has been written out to '${tail_path}'.",
+              ("num", block_num + 1)("tail_path", tail_path));
+      }
+   }
+
    fc::path block_log::repair_log(const fc::path& data_dir, uint32_t truncate_at_block) {
       ilog("Recovering Block Log...");
-      EOS_ASSERT( fc::is_directory(data_dir) && fc::is_regular_file(data_dir / "blocks.log"), block_log_not_found,
-                 "Block log not found in '${blocks_dir}'", ("blocks_dir", data_dir)          );
+      EOS_ASSERT(fc::is_directory(data_dir) && fc::is_regular_file(data_dir / "blocks.log"), block_log_not_found,
+                 "Block log not found in '${blocks_dir}'", ("blocks_dir", data_dir));
 
       auto now = fc::time_point::now();
 
-      auto blocks_dir = fc::canonical( data_dir );
-      if( blocks_dir.filename().generic_string() == "." ) {
+      auto blocks_dir = fc::canonical(data_dir);
+      if (blocks_dir.filename().generic_string() == ".") {
          blocks_dir = blocks_dir.parent_path();
       }
-      auto backup_dir = blocks_dir.parent_path();
+      auto backup_dir      = blocks_dir.parent_path();
       auto blocks_dir_name = blocks_dir.filename();
-      EOS_ASSERT( blocks_dir_name.generic_string() != ".", block_log_exception, "Invalid path to blocks directory" );
-      backup_dir = backup_dir / blocks_dir_name.generic_string().append("-").append( now );
+      EOS_ASSERT(blocks_dir_name.generic_string() != ".", block_log_exception, "Invalid path to blocks directory");
+      backup_dir = backup_dir / blocks_dir_name.generic_string().append("-").append(now);
 
-      EOS_ASSERT( !fc::exists(backup_dir), block_log_backup_dir_exist,
+      EOS_ASSERT(!fc::exists(backup_dir), block_log_backup_dir_exist,
                  "Cannot move existing blocks directory to already existing directory '${new_blocks_dir}'",
-                 ("new_blocks_dir", backup_dir) );
+                 ("new_blocks_dir", backup_dir));
 
-      fc::rename( blocks_dir, backup_dir );
-      ilog( "Moved existing blocks directory to backup location: '${new_blocks_dir}'", ("new_blocks_dir", backup_dir) );
+      fc::rename(blocks_dir, backup_dir);
+      ilog("Moved existing blocks directory to backup location: '${new_blocks_dir}'", ("new_blocks_dir", backup_dir));
 
       fc::create_directories(blocks_dir);
       auto block_log_path = blocks_dir / "blocks.log";
 
-      ilog( "Reconstructing '${new_block_log}' from backed up block log", ("new_block_log", block_log_path) );
+      ilog("Reconstructing '${new_block_log}' from backed up block log", ("new_block_log", block_log_path));
+      auto        block_log_path_string = block_log_path.generic_string();
+      const char* block_file_name       = block_log_path_string.c_str();
 
-      std::fstream  old_block_stream;
-      std::fstream  new_block_stream;
+      auto          pos       = 0;
+      uint32_t      block_num = 0;
+      block_id_type previous;
 
-      old_block_stream.open( (backup_dir / "blocks.log").generic_string().c_str(), LOG_READ );
-      new_block_stream.open( block_log_path.generic_string().c_str(), LOG_WRITE );
+      boost::iostreams::mapped_file_source log_data((backup_dir / "blocks.log").generic_string());
+      fc::datastream<const char*> ds(log_data.data(), log_data.size());
 
-      old_block_stream.seekg( 0, std::ios::end );
-      uint64_t end_pos = old_block_stream.tellg();
-      old_block_stream.seekg( 0 );
-
-      uint32_t version = 0;
-      old_block_stream.read( (char*)&version, sizeof(version) );
-      EOS_ASSERT( version > 0, block_log_exception, "Block log was not setup properly" );
-      EOS_ASSERT( is_supported_version(version), block_log_unsupported_version,
-                 "Unsupported version of block log. Block log version is ${version} while code supports version(s) [${min},${max}]",
-                 ("version", version)("min", block_log::min_supported_version)("max", block_log::max_supported_version) );
-
-      new_block_stream.write( (char*)&version, sizeof(version) );
-
-      uint32_t first_block_num = 1;
-      if (version != 1) {
-         old_block_stream.read ( (char*)&first_block_num, sizeof(first_block_num) );
-
-         // this assert is only here since repair_log is only used for --hard-replay-blockchain, which removes any
-         // existing state, if another API needs to use it, this can be removed and the check for the first block's
-         // previous block id will need to accommodate this.
-         EOS_ASSERT( first_block_num == 1, block_log_exception,
-                     "Block log ${file} must contain a genesis state and start at block number 1.  This block log "
-                     "starts at block number ${first_block_num}.",
-                     ("file", (backup_dir / "blocks.log").generic_string())("first_block_num", first_block_num));
-
-         new_block_stream.write( (char*)&first_block_num, sizeof(first_block_num) );
-      }
-
-      if (contains_genesis_state(version, first_block_num)) {
-         genesis_state gs;
-         fc::raw::unpack(old_block_stream, gs);
-
-         auto data = fc::raw::pack( gs );
-         new_block_stream.write( data.data(), data.size() );
-      }
-      else if (contains_chain_id(version, first_block_num)) {
-         chain_id_type chain_id;
-         old_block_stream >> chain_id;
-
-         new_block_stream << chain_id;
-      }
-      else {
-         EOS_THROW( block_log_exception,
-                    "Block log ${file} is not supported. version: ${ver} and first_block_num: ${fbn} does not contain "
-                    "a genesis_state nor a chain_id.",
-                    ("file", (backup_dir / "blocks.log").generic_string())("ver", version)("fbn", first_block_num));
-      }
-
-      if (version != 1) {
-         auto expected_totem = npos;
-         std::decay_t<decltype(npos)> actual_totem;
-         old_block_stream.read ( (char*)&actual_totem, sizeof(actual_totem) );
-
-         EOS_ASSERT(actual_totem == expected_totem, block_log_exception,
-                    "Expected separator between block log header and blocks was not found( expected: ${e}, actual: ${a} )",
-                    ("e", fc::to_hex((char*)&expected_totem, sizeof(expected_totem) ))("a", fc::to_hex((char*)&actual_totem, sizeof(actual_totem) )));
-
-         new_block_stream.write( (char*)&actual_totem, sizeof(actual_totem) );
-      }
-
-      std::exception_ptr          except_ptr;
-      vector<char>                incomplete_block_data;
-      optional<detail::log_entry> bad_block;
-      uint32_t                    block_num = 0;
-
-      block_id_type expected_previous;
-
-      uint64_t pos = old_block_stream.tellg();
+      block_log_preamble preamble;
+      preamble.read(ds);
 
       detail::log_entry entry;
-      if (version < 4) {
+      if (preamble.version < 4) {
          entry.emplace<signed_block>();
       }
 
-      while( pos < end_pos ) {
-         try {
-            unpack(old_block_stream, entry);
-         } catch (...) {
-            except_ptr = std::current_exception();
-            incomplete_block_data.resize( end_pos - pos );
-            old_block_stream.read( incomplete_block_data.data(), incomplete_block_data.size() );
-            break;
-         }
+      pos                             = ds.tellp();
+      std::string error_msg;
 
-         auto id = std::visit([](const auto& v) { return v.id(); }, entry);
-         if( block_header::num_from_id(expected_previous) + 1 != block_header::num_from_id(id) ) {
-            elog( "Block ${num} (${id}) skips blocks. Previous block in block log is block ${prev_num} (${previous})",
-                  ("num", block_header::num_from_id(id))("id", id)
-                  ("prev_num", block_header::num_from_id(expected_previous))("previous", expected_previous) );
-         }
-         auto actual_previous = std::visit([](const auto& v) { return v.previous; }, entry);
-         if( expected_previous != actual_previous ) {
-            elog( "Block ${num} (${id}) does not link back to previous block. "
-                  "Expected previous: ${expected}. Actual previous: ${actual}.",
-                  ("num", block_header::num_from_id(id))("id", id)("expected", expected_previous)("actual", actual_previous) );
-         }
-         expected_previous = id;
+      try {
+         while (ds.remaining() > 0) {
+            try {
+               detail::unpack(ds, entry);
+            } catch (...) {
+               write_incomplete_block_data(blocks_dir, now, block_num, log_data.data() + pos, log_data.size() - pos);
+               throw;
+            }
 
-         uint64_t tmp_pos = std::numeric_limits<uint64_t>::max();
-         if( (static_cast<uint64_t>(old_block_stream.tellg()) + sizeof(pos)) <= end_pos ) {
-            old_block_stream.read( reinterpret_cast<char*>(&tmp_pos), sizeof(tmp_pos) );
-         }
-         if( pos != tmp_pos ) {
-            bad_block.emplace(std::move(entry));
-            break;
-         }
+            const block_header& hdr = std::visit([](const auto& v) -> const block_header& { return v; }, entry);
 
-         auto data = detail::pack(entry);
-         new_block_stream.write( data.data(), data.size() );
-         new_block_stream.write( reinterpret_cast<char*>(&pos), sizeof(pos) );
-         block_num = std::visit([](const auto& v) { return v.block_num(); }, entry);
-         if(block_num % 1000 == 0)
-            ilog( "Recovered block ${num}", ("num", block_num) );
-         pos = new_block_stream.tellp();
-         if( block_num == truncate_at_block )
-            break;
+            if (!verify_block(ds, previous, pos, hdr)) {
+               fc::variant last_block = std::visit(
+                   [](const auto& v) {
+                      fc::variant r;
+                      fc::to_variant(v, r);
+                      return r;
+                   },
+                   entry);
+               ilog("Recovered only up to block number ${num}. Last block in block log was not properly "
+                    "committed:\n${last_block}",
+                    ("num", block_num)("last_block", last_block));
+               break;
+            }
+
+            previous  = hdr.id();
+            block_num = hdr.block_num();
+
+            if (block_num % 1000 == 0)
+               ilog("Verified block ${num}", ("num", block_num));
+            pos = ds.tellp();
+            if (block_num == truncate_at_block)
+               break;
+         }
+      } catch (const fc::exception& e) {
+         error_msg = e.what();
+      } catch (const std::exception& e) {
+         error_msg = e.what();
+      } catch (...) {
+         error_msg = "unrecognized exception";
       }
 
-      if( bad_block.valid() ) {
-         fc::variant last_block = std::visit(
-             [](const auto& v) {
-                fc::variant r;
-                fc::to_variant(v, r);
-                return r;
-             },
-             *bad_block);
-         ilog("Recovered only up to block number ${num}. Last block in block log was not properly "
-              "committed:\n${last_block}",
-              ("num", block_num)("last_block", last_block));
-      } else if( except_ptr ) {
-         std::string error_msg;
+      FILE* fp = fopen(block_file_name, "w");
+      EOS_ASSERT(fp != nullptr, block_log_exception, "Could not create block log file: ${name}", ("name", block_file_name));
+      int nwritten = fwrite(log_data.data(), 1,  pos, fp);
+      fclose(fp);
 
-         try {
-            std::rethrow_exception(except_ptr);
-         } catch( const fc::exception& e ) {
-            error_msg = e.what();
-         } catch( const std::exception& e ) {
-            error_msg = e.what();
-         } catch( ... ) {
-            error_msg = "unrecognized exception";
-         }
+      EOS_ASSERT(
+          nwritten == pos, block_log_exception,
+          "Unable to write the entire block log file: ${name}, expected size=${expected}, written size=${written}",
+          ("name", block_file_name)("expected", pos)("written", nwritten));
 
-         ilog( "Recovered only up to block number ${num}. "
-               "The block ${next_num} could not be deserialized from the block log due to error:\n${error_msg}",
-               ("num", block_num)("next_num", block_num+1)("error_msg", error_msg) );
-
-         auto tail_path = blocks_dir / std::string("blocks-bad-tail-").append( now ).append(".log");
-         if( !fc::exists(tail_path) && incomplete_block_data.size() > 0 ) {
-            std::fstream tail_stream;
-            tail_stream.open( tail_path.generic_string().c_str(), LOG_WRITE );
-            tail_stream.write( incomplete_block_data.data(), incomplete_block_data.size() );
-
-            ilog( "Data at tail end of block log which should contain the (incomplete) serialization of block ${num} "
-                  "has been written out to '${tail_path}'.",
-                  ("num", block_num+1)("tail_path", tail_path) );
-         }
-      } else if( block_num == truncate_at_block && pos < end_pos ) {
-         ilog( "Stopped recovery of block log early at specified block number: ${stop}.", ("stop", truncate_at_block) );
+      if (error_msg.size()) {
+         ilog("Recovered only up to block number ${num}. "
+              "The block ${next_num} could not be deserialized from the block log due to error:\n${error_msg}",
+              ("num", block_num)("next_num", block_num + 1)("error_msg", error_msg));
+      } else if (block_num == truncate_at_block && pos < log_data.size()) {
+         ilog("Stopped recovery of block log early at specified block number: ${stop}.", ("stop", truncate_at_block));
       } else {
-         ilog( "Existing block log was undamaged. Recovered all irreversible blocks up to block number ${num}.", ("num", block_num) );
+         ilog("Existing block log was undamaged. Recovered all irreversible blocks up to block number ${num}.",
+              ("num", block_num));
       }
-
       return backup_dir;
-
-   }
-
-   template <typename ChainContext, typename Lambda>
-   fc::optional<ChainContext> detail::block_log_impl::extract_chain_context( const fc::path& data_dir, Lambda&& lambda ) {
-      EOS_ASSERT( fc::is_directory(data_dir) && fc::is_regular_file(data_dir / "blocks.log"), block_log_not_found,
-                  "Block log not found in '${blocks_dir}'", ("blocks_dir", data_dir)          );
-
-      std::fstream  block_stream;
-      block_stream.open( (data_dir / "blocks.log").generic_string().c_str(), LOG_READ );
-
-      uint32_t version = 0;
-      block_stream.read( (char*)&version, sizeof(version) );
-      EOS_ASSERT( version >= block_log::min_supported_version && version <= block_log::max_supported_version, block_log_unsupported_version,
-                  "Unsupported version of block log. Block log version is ${version} while code supports version(s) [${min},${max}]",
-                  ("version", version)("min", block_log::min_supported_version)("max", block_log::max_supported_version) );
-
-      uint32_t first_block_num = 1;
-      if (version != 1) {
-         block_stream.read ( (char*)&first_block_num, sizeof(first_block_num) );
-      }
-
-      return lambda(block_stream, version, first_block_num);
    }
 
    fc::optional<genesis_state> block_log::extract_genesis_state( const fc::path& data_dir ) {
-      return detail::block_log_impl::extract_chain_context<genesis_state>(data_dir, [](std::fstream& block_stream, uint32_t version, uint32_t first_block_num ) -> fc::optional<genesis_state> {
-         if (contains_genesis_state(version, first_block_num)) {
-            genesis_state gs;
-            fc::raw::unpack(block_stream, gs);
-            return gs;
-         }
-
-         // current versions only have a genesis state if they start with block number 1
-         return fc::optional<genesis_state>();
-      });
+      boost::iostreams::mapped_file_source log( (data_dir / "blocks.log").generic_string() );
+      block_log_preamble                   preamble;
+      return preamble.extract_genesis_state(fc::datastream<const char*>(log.data(), log.size()));
    }
 
    chain_id_type block_log::extract_chain_id( const fc::path& data_dir ) {
-      return *(detail::block_log_impl::extract_chain_context<chain_id_type>(data_dir, [](std::fstream& block_stream, uint32_t version, uint32_t first_block_num ) -> fc::optional<chain_id_type> {
-         // supported versions either contain a genesis state, or else the chain id only
-         if (contains_genesis_state(version, first_block_num)) {
-            genesis_state gs;
-            fc::raw::unpack(block_stream, gs);
-            return gs.compute_chain_id();
-         }
-         EOS_ASSERT( contains_chain_id(version, first_block_num), block_log_exception,
-                     "Block log error! version: ${version} with first_block_num: ${num} does not contain a "
-                     "chain id or genesis state, so the chain id cannot be determined.",
-                     ("version", version)("num", first_block_num) );
-         chain_id_type chain_id;
-         fc::raw::unpack(block_stream, chain_id);
-         return chain_id;
-      }));
+      boost::iostreams::mapped_file_source log( (data_dir / "blocks.log").generic_string() );
+      block_log_preamble                   preamble;
+      fc::datastream<const char*>          ds(log.data(), log.size());
+      preamble.read(ds);
+      return preamble.id;
    }
 
    bool prune(pruned_transaction& ptx) { 
@@ -1135,25 +1140,21 @@ namespace eosio { namespace chain {
       ~trim_data();
       uint64_t block_index(uint32_t n) const;
       uint64_t block_pos(uint32_t n);
+
       fc::path block_file_name, index_file_name;        //full pathname for blocks.log and blocks.index
-      uint32_t version = 0;                              //blocklog version
-      uint32_t first_block = 0;                          //first block in blocks.log
-      uint32_t last_block = 0;                          //last block in blocks.log
-      FILE* blk_in = nullptr;                            //C style files for reading blocks.log and blocks.index
-      FILE* ind_in = nullptr;                            //C style files for reading blocks.log and blocks.index
-      //we use low level file IO because it is distinctly faster than C++ filebuf or iostream
-      uint64_t first_block_pos = 0;                      //file position in blocks.log for the first block in the log
-      chain_id_type chain_id;
+      boost::iostreams::mapped_file_source log;
+      boost::iostreams::mapped_file_source index;
+      block_log_preamble                   preamble;
+      uint32_t                             last_block = 0; // last block in blocks.log
    };
 
 
    bool block_log::trim_blocklog_front(const fc::path& block_dir, const fc::path& temp_dir, uint32_t truncate_at_block) {
-      using namespace std;
       EOS_ASSERT( block_dir != temp_dir, block_log_exception, "block_dir and temp_dir need to be different directories" );
       ilog("In directory ${dir} will trim all blocks before block ${n} from blocks.log and blocks.index.",
            ("dir", block_dir.generic_string())("n", truncate_at_block));
       trim_data original_block_log(block_dir);
-      if (truncate_at_block <= original_block_log.first_block) {
+      if (truncate_at_block <= original_block_log.preamble.first_block_num) {
          ilog("There are no blocks before block ${n} so do nothing.", ("n", truncate_at_block));
          return false;
       }
@@ -1183,7 +1184,7 @@ namespace eosio { namespace chain {
       new_block_file.write((char*)&version, sizeof(version));
       new_block_file.write((char*)&truncate_at_block, sizeof(truncate_at_block));
 
-      new_block_file << original_block_log.chain_id;
+      new_block_file << original_block_log.preamble.id;
 
       // append a totem to indicate the division between blocks and header
       auto totem = block_log::npos;
@@ -1193,21 +1194,20 @@ namespace eosio { namespace chain {
       // ****** end of new block log header
 
       // copy over remainder of block log to new block log
-      auto buffer =  make_unique<char[]>(detail::reverse_iterator::_buf_len);
+      auto buffer =  std::make_unique<char[]>(detail::reverse_iterator::_buf_len);
       char* buf =  buffer.get();
+
 
       // offset bytes to shift from old blocklog position to new blocklog position
       const uint64_t original_file_block_pos = original_block_log.block_pos(truncate_at_block);
       const uint64_t pos_delta = original_file_block_pos - new_block_file_first_block_pos;
-      auto status = fseek(original_block_log.blk_in, 0, SEEK_END);
-      EOS_ASSERT( status == 0, block_log_exception, "blocks.log seek failed" );
 
       // all blocks to copy to the new blocklog
-      const uint64_t to_write = ftell(original_block_log.blk_in) - original_file_block_pos;
+      const uint64_t to_write = original_block_log.log.size() - original_file_block_pos;
       const auto pos_size = sizeof(uint64_t);
 
       // start with the last block's position stored at the end of the block
-      uint64_t original_pos = ftell(original_block_log.blk_in) - pos_size;
+      uint64_t original_pos = original_block_log.log.size() - pos_size;
 
       const auto num_blocks = original_block_log.last_block - truncate_at_block + 1;
 
@@ -1223,9 +1223,7 @@ namespace eosio { namespace chain {
 
          // read in the previous contiguous memory into the read buffer
          const auto start_of_blk_buffer_pos = original_file_block_pos + to_write_remaining - read_size;
-         status = fseek(original_block_log.blk_in, start_of_blk_buffer_pos, SEEK_SET);
-         const auto num_read = fread(buf, read_size, 1, original_block_log.blk_in);
-         EOS_ASSERT( num_read == 1, block_log_exception, "blocks.log read failed" );
+         memcpy(buf, original_block_log.log.data() + start_of_blk_buffer_pos, read_size);
 
          // walk this memory section to adjust block position to match the adjusted location
          // of the block start and store in the new index file
@@ -1241,8 +1239,6 @@ namespace eosio { namespace chain {
          new_block_file.write(buf, read_size);
       }
       index.complete();
-      fclose(original_block_log.blk_in);
-      original_block_log.blk_in = nullptr;
       new_block_file.flush();
       new_block_file.close();
 
@@ -1260,121 +1256,57 @@ namespace eosio { namespace chain {
 
    trim_data::trim_data(fc::path block_dir) {
 
-      // code should follow logic in block_log::repair_log
-
-      using namespace std;
       block_file_name = block_dir / "blocks.log";
-      blk_in = FC_FOPEN(block_file_name.generic_string().c_str(), "rb");
-      EOS_ASSERT( blk_in != nullptr, block_log_not_found, "cannot read file ${file}", ("file",block_file_name.string()) );
+      auto blk_file = block_file_name.generic_string();
+      log.open(blk_file);
+      fc::datastream<const char*>          ds(log.data(), log.size());
+      preamble.read(ds);
 
-      auto size = fread((void*)&version,sizeof(version), 1, blk_in);
-      EOS_ASSERT( size == 1, block_log_unsupported_version, "invalid format for file ${file}", ("file",block_file_name.string()));
-      ilog("block log version= ${version}",("version",version));
-      EOS_ASSERT( block_log::is_supported_version(version), block_log_unsupported_version, "block log version ${v} is not supported", ("v",version));
-
-      detail::fileptr_datastream ds(blk_in, block_file_name.string());
-      if (version == 1) {
-         first_block = 1;
-         genesis_state gs;
-         fc::raw::unpack(ds, gs);
-         chain_id = gs.compute_chain_id();
-      }
-      else {
-         size = fread((void *) &first_block, sizeof(first_block), 1, blk_in);
-         EOS_ASSERT(size == 1, block_log_exception, "invalid format for file ${file}",
-                    ("file", block_file_name.string()));
-         if (block_log::contains_genesis_state(version, first_block)) {
-            genesis_state gs;
-            fc::raw::unpack(ds, gs);
-            chain_id = gs.compute_chain_id();
-         }
-         else if (block_log::contains_chain_id(version, first_block)) {
-            ds >> chain_id;
-         }
-         else {
-            EOS_THROW( block_log_exception,
-                       "Block log ${file} is not supported. version: ${ver} and first_block: ${first_block} does not contain "
-                       "a genesis_state nor a chain_id.",
-                       ("file", block_file_name.string())("ver", version)("first_block", first_block));
-         }
-
-         const auto expected_totem = block_log::npos;
-         std::decay_t<decltype(block_log::npos)> actual_totem;
-         size = fread ( (char*)&actual_totem, sizeof(actual_totem), 1, blk_in);
-
-         EOS_ASSERT(size == 1, block_log_exception,
-                    "Expected to read ${size} bytes, but did not read any bytes", ("size", sizeof(actual_totem)));
-         EOS_ASSERT(actual_totem == expected_totem, block_log_exception,
-                    "Expected separator between block log header and blocks was not found( expected: ${e}, actual: ${a} )",
-                    ("e", fc::to_hex((char*)&expected_totem, sizeof(expected_totem) ))("a", fc::to_hex((char*)&actual_totem, sizeof(actual_totem) )));
-      }
-
-      const uint64_t start_of_blocks = ftell(blk_in);
+      const uint64_t start_of_blocks = ds.tellp();
 
       index_file_name = block_dir / "blocks.index";
-      ind_in = FC_FOPEN(index_file_name.generic_string().c_str(), "rb");
-      EOS_ASSERT( ind_in != nullptr, block_log_not_found, "cannot read file ${file}", ("file",index_file_name.string()) );
+      index.open(index_file_name.generic_string());
+      const uint64_t file_end = index.size();
 
-      const auto status = fseek(ind_in, 0, SEEK_END);                //get length of blocks.index (gives number of blocks)
-      EOS_ASSERT( status == 0, block_log_exception, "cannot seek to ${file} end", ("file", index_file_name.string()) );
-      const uint64_t file_end = ftell(ind_in);                //get length of blocks.index (gives number of blocks)
-      last_block = first_block + file_end/sizeof(uint64_t) - 1;
+      last_block = preamble.first_block_num + file_end/sizeof(uint64_t) - 1;
 
-      first_block_pos = block_pos(first_block);
+      auto first_block_pos = block_pos(preamble.first_block_num);
       EOS_ASSERT(start_of_blocks == first_block_pos, block_log_exception,
                  "Block log ${file} was determined to have its first block at ${determined}, but the block index "
                  "indicates the first block is at ${index}",
                  ("file", block_file_name.string())("determined", start_of_blocks)("index",first_block_pos));
-      ilog("first block= ${first}",("first",first_block));
+      ilog("first block= ${first}",("first",preamble.first_block_num));
       ilog("last block= ${last}",("last",last_block));
    }
 
    trim_data::~trim_data() {
-      if (blk_in != nullptr)
-         fclose(blk_in);
-      if (ind_in != nullptr)
-         fclose(ind_in);
    }
 
    uint64_t trim_data::block_index(uint32_t n) const {
-      using namespace std;
-      EOS_ASSERT( first_block <= n, block_log_exception,
+      EOS_ASSERT( preamble.first_block_num <= n, block_log_exception,
                   "cannot seek in ${file} to block number ${b}, block number ${first} is the first block",
-                  ("file", index_file_name.string())("b",n)("first",first_block) );
+                  ("file", index_file_name.string())("b",n)("first",preamble.first_block_num) );
       EOS_ASSERT( n <= last_block, block_log_exception,
                   "cannot seek in ${file} to block number ${b}, block number ${last} is the last block",
                   ("file", index_file_name.string())("b",n)("last",last_block) );
-      return sizeof(uint64_t) * (n - first_block);
+      return sizeof(uint64_t) * (n - preamble.first_block_num);
    }
 
    uint64_t trim_data::block_pos(uint32_t n) {
-      using namespace std;
       // can indicate the location of the block after the last block
       if (n == last_block + 1) {
-         return ftell(blk_in);
+         return log.size();
       }
       const uint64_t index_pos = block_index(n);
-      auto status = fseek(ind_in, index_pos, SEEK_SET);
-      EOS_ASSERT( status == 0, block_log_exception, "cannot seek to ${file} ${pos} from beginning of file for block ${b}", ("file", index_file_name.string())("pos", index_pos)("b",n) );
-      const uint64_t pos = ftell(ind_in);
-      EOS_ASSERT( pos == index_pos, block_log_exception, "cannot seek to ${file} entry for block ${b}", ("file", index_file_name.string())("b",n) );
-      uint64_t block_n_pos;
-      auto size = fread((void*)&block_n_pos, sizeof(block_n_pos), 1, ind_in);                   //filepos of block n
-      EOS_ASSERT( size == 1, block_log_exception, "cannot read ${file} entry for block ${b}", ("file", index_file_name.string())("b",n) );
+      uint64_t block_n_pos = read_buffer<uint64_t>(index.data() + index_pos);
 
       //read blocks.log and verify block number n is found at the determined file position
-      const auto calc_blknum_pos = block_n_pos + detail::block_log_impl::blknum_offset_from_block_entry(version);
-      status = fseek(blk_in, calc_blknum_pos, SEEK_SET);
-      EOS_ASSERT( status == 0, block_log_exception, "cannot seek to ${file} ${pos} from beginning of file", ("file", block_file_name.string())("pos", calc_blknum_pos) );
-      const uint64_t block_offset_pos = ftell(blk_in);
-      EOS_ASSERT( block_offset_pos == calc_blknum_pos, block_log_exception, "cannot seek to ${file} ${pos} from beginning of file", ("file", block_file_name.string())("pos", calc_blknum_pos) );
-      uint32_t prior_blknum;
-      size = fread((void*)&prior_blknum, sizeof(prior_blknum), 1, blk_in);     //read bigendian block number of prior block
-      EOS_ASSERT( size == 1, block_log_exception, "cannot read prior block");
-      const uint32_t bnum = fc::endian_reverse_u32(prior_blknum) + 1;          //convert to little endian, add 1 since prior block
+      const auto calc_blknum_pos = block_n_pos + detail::block_log_impl::blknum_offset_from_block_entry(preamble.version);
+      const uint32_t bnum = detail::block_log_impl::block_num_for_entry_at(log.data() + block_n_pos, preamble.version); 
+
       EOS_ASSERT( bnum == n, block_log_exception,
                   "At position ${pos} in ${file} expected to find ${exp_bnum} but found ${act_bnum}",
-                  ("pos",block_offset_pos)("file", block_file_name.string())("exp_bnum",n)("act_bnum",bnum) );
+                  ("pos",calc_blknum_pos)("file", block_file_name.string())("exp_bnum",n)("act_bnum",bnum) );
 
       return block_n_pos;
    }
@@ -1385,7 +1317,7 @@ namespace eosio { namespace chain {
       ilog("In directory ${block_dir} will trim all blocks after block ${n} from ${block_file} and ${index_file}",
          ("block_dir", block_dir.generic_string())("n", n)("block_file",td.block_file_name.generic_string())("index_file", td.index_file_name.generic_string()));
 
-      if (n < td.first_block) {
+      if (n < td.preamble.first_block_num) {
          dlog("All blocks are after block ${n} so do nothing (trim_end would delete entire blocks.log)",("n", n));
          return 1;
       }
@@ -1403,24 +1335,15 @@ namespace eosio { namespace chain {
 
    void block_log::smoke_test(fc::path block_dir) {
       trim_data td(block_dir);
-      auto status = fseek(td.blk_in, -sizeof(uint64_t), SEEK_END);             //get last_block from blocks.log, compare to from blocks.index
-      EOS_ASSERT( status == 0, block_log_exception, "cannot seek to ${file} ${pos} from beginning of file", ("file", td.block_file_name.string())("pos", sizeof(uint64_t)) );
-      uint64_t file_pos;
-      auto size = fread((void*)&file_pos, sizeof(uint64_t), 1, td.blk_in);
-      EOS_ASSERT( size == 1, block_log_exception, "${file} read fails", ("file", td.block_file_name.string()) );
-      int blknum_offset = detail::block_log_impl::blknum_offset_from_block_entry(td.version);
-      status            = fseek(td.blk_in, file_pos + blknum_offset, SEEK_SET);
-      EOS_ASSERT( status == 0, block_log_exception, "cannot seek to ${file} ${pos} from beginning of file", ("file", td.block_file_name.string())("pos", file_pos + blknum_offset) );
-      uint32_t bnum;
-      size = fread((void*)&bnum, sizeof(uint32_t), 1, td.blk_in);
-      EOS_ASSERT( size == 1, block_log_exception, "${file} read fails", ("file", td.block_file_name.string()) );
-      bnum = fc::endian_reverse_u32(bnum) + 1;                       //convert from big endian to little endian and add 1
+      uint64_t file_pos = read_buffer<uint64_t>(td.log.data() + td.log.size() - sizeof(uint64_t));
+      uint32_t bnum = detail::block_log_impl::block_num_for_entry_at(td.log.data() + file_pos, td.preamble.version);
+
       EOS_ASSERT( td.last_block == bnum, block_log_exception, "blocks.log says last block is ${lb} which disagrees with blocks.index", ("lb", bnum) );
       ilog("blocks.log and blocks.index agree on number of blocks");
-      uint32_t delta = (td.last_block + 8 - td.first_block) >> 3;
+      uint32_t delta = (td.last_block + 8 - td.preamble.first_block_num) >> 3;
       if (delta < 1)
          delta = 1;
-      for (uint32_t n = td.first_block; ; n += delta) {
+      for (uint32_t n = td.preamble.first_block_num; ; n += delta) {
          if (n > td.last_block)
             n = td.last_block;
          td.block_pos(n);                                 //check block 'n' is where blocks.index says
