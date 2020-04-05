@@ -46,6 +46,91 @@ namespace eosio { namespace chain {
       return result;
    }
 
+
+   struct block_log_preamble {
+      uint32_t version;
+      uint32_t first_block_num;
+      chain_id_type id;
+
+      template <typename Stream>
+      void validate_totem(Stream& ds) const {
+         if (version != 1) {
+            auto                                    expected_totem = block_log::npos;
+            std::decay_t<decltype(block_log::npos)> actual_totem;
+            ds.read((char*)&actual_totem, sizeof(actual_totem));
+
+            EOS_ASSERT(
+                actual_totem == expected_totem, block_log_exception,
+                "Expected separator between block log header and blocks was not found( expected: ${e}, actual: ${a} )",
+                ("e", fc::to_hex((char*)&expected_totem, sizeof(expected_totem)))(
+                    "a", fc::to_hex((char*)&actual_totem, sizeof(actual_totem))));
+         }
+      }
+
+      template <typename Stream>
+      chain_id_type extract_chain_id(Stream& ds) const {
+         chain_id_type chain_id;
+         if (block_log::contains_genesis_state(version, first_block_num)) {
+            genesis_state state;
+            fc::raw::unpack(ds, state);
+            chain_id = state.compute_chain_id();
+         } else if (block_log::contains_chain_id(version, first_block_num)) {
+            ds >> chain_id;
+         } else {
+            EOS_THROW(block_log_exception,
+                      "Block log is not supported. version: ${ver} and first_block_num: ${fbn} does not contain "
+                      "a genesis_state nor a chain_id.",
+                      ("ver", version)("fbn", first_block_num));
+         }
+
+         validate_totem(ds);
+         return chain_id;
+      }
+
+      template <typename Stream, typename ContextExtractor>
+      void read(Stream&& ds, ContextExtractor&& extractor) {
+
+         ds.read((char*)&version, sizeof(version));
+         EOS_ASSERT(version > 0, block_log_exception, "Block log was not setup properly");
+         EOS_ASSERT(
+             block_log::is_supported_version(version), block_log_unsupported_version,
+             "Unsupported version of block log. Block log version is ${version} while code supports version(s) "
+             "[${min},${max}]",
+             ("version", version)("min", block_log::min_supported_version)("max", block_log::max_supported_version));
+
+         first_block_num = 1;
+         if (version != 1) {
+            ds.read((char*)&first_block_num, sizeof(first_block_num));
+         }
+
+         extractor(std::forward<Stream>(ds), *this);
+      }
+
+      template <typename Stream>
+      void read(Stream& ds) {
+         this->read(ds, [](auto& ds, block_log_preamble& preamble) { preamble.id = preamble.extract_chain_id(ds); });
+      }
+
+      fc::optional<genesis_state> extract_genesis_state(fc::datastream<const char*>&& ds) { 
+         fc::optional<genesis_state> result;
+         this->read(std::move(ds), [&result](auto&& ds, const block_log_preamble& preamble) {
+            if (block_log::contains_genesis_state(preamble.version, preamble.first_block_num)) {
+               genesis_state state;
+               fc::raw::unpack(ds, state);
+               preamble.validate_totem(ds);
+               result = state;
+            }
+          });
+         return result;
+      }
+
+      template <typename Stream,
+                class = typename std::enable_if<!std::is_lvalue_reference<Stream>::value>::type>
+      void read_and_ignore_context(Stream&& ds) {
+         this->read(std::move(ds), [](auto&& ds, const block_log_preamble& preamble) {});
+      }
+   };
+
    namespace detail {
       using unique_file = std::unique_ptr<FILE, decltype(&fclose)>;
 
@@ -195,26 +280,17 @@ namespace eosio { namespace chain {
          // open a block log file and return the total number of blocks in it
          uint32_t open(const fc::path& block_file_name);
          uint64_t previous();
-         uint32_t version() const { return _version; }
-         uint32_t first_block_num() const { return _first_block_num; }
+         uint32_t version() const { return _preamble.version; }
+         uint32_t first_block_num() const { return _preamble.first_block_num; }
          constexpr static uint32_t      _buf_len                          = 1U << 24;
       private:
-         void update_buffer();
-
-         unique_file                    _file;
-         uint32_t                       _version                          = 0;
-         uint32_t                       _first_block_num                  = 0;
-         uint32_t                       _last_block_num                   = 0;
-         uint32_t                       _blocks_found                     = 0;
-         uint32_t                       _blocks_expected                  = 0;
-         uint64_t                       _current_position_in_file         = 0;
-         uint64_t                       _eof_position_in_file             = 0;
-         uint64_t                       _end_of_buffer_position           = _unset_position;
-         uint64_t                       _start_of_buffer_position         = 0;
-         std::unique_ptr<char[]>        _buffer_ptr;
-         std::string                    _block_file_name;
-         constexpr static int64_t       _unset_position                   = -1;
-         constexpr static uint64_t      _position_size                    = sizeof(_current_position_in_file);
+         boost::iostreams::mapped_file_source _log;
+         block_log_preamble                   _preamble;
+         uint32_t                             _last_block_num           = 0;
+         uint32_t                             _blocks_found             = 0;
+         uint32_t                             _blocks_expected          = 0;
+         uint64_t                             _current_position_in_file = 0;
+         std::string                          _block_file_name;
       };
 
       constexpr uint64_t buffer_location_to_file_location(uint32_t buffer_location) { return buffer_location << 3; }
@@ -280,89 +356,7 @@ FC_REFLECT_DERIVED(eosio::chain::detail::log_entry_v4, (eosio::chain::pruned_blo
 
 namespace eosio { namespace chain {
 
-   struct block_log_preamble {
-      uint32_t version;
-      uint32_t first_block_num;
-      chain_id_type id;
 
-      template <typename Stream>
-      void validate_totem(Stream& ds) const {
-         if (version != 1) {
-            auto                                    expected_totem = block_log::npos;
-            std::decay_t<decltype(block_log::npos)> actual_totem;
-            ds.read((char*)&actual_totem, sizeof(actual_totem));
-
-            EOS_ASSERT(
-                actual_totem == expected_totem, block_log_exception,
-                "Expected separator between block log header and blocks was not found( expected: ${e}, actual: ${a} )",
-                ("e", fc::to_hex((char*)&expected_totem, sizeof(expected_totem)))(
-                    "a", fc::to_hex((char*)&actual_totem, sizeof(actual_totem))));
-         }
-      }
-
-      template <typename Stream>
-      chain_id_type extract_chain_id(Stream& ds) const {
-         chain_id_type chain_id;
-         if (block_log::contains_genesis_state(version, first_block_num)) {
-            genesis_state state;
-            fc::raw::unpack(ds, state);
-            chain_id = state.compute_chain_id();
-         } else if (block_log::contains_chain_id(version, first_block_num)) {
-            ds >> chain_id;
-         } else {
-            EOS_THROW(block_log_exception,
-                      "Block log is not supported. version: ${ver} and first_block_num: ${fbn} does not contain "
-                      "a genesis_state nor a chain_id.",
-                      ("ver", version)("fbn", first_block_num));
-         }
-
-         validate_totem(ds);
-         return chain_id;
-      }
-
-      template <typename Stream, typename ContextExtractor>
-      void read(Stream&& ds, ContextExtractor&& extractor) {
-
-         ds.read((char*)&version, sizeof(version));
-         EOS_ASSERT(version > 0, block_log_exception, "Block log was not setup properly");
-         EOS_ASSERT(
-             block_log::is_supported_version(version), block_log_unsupported_version,
-             "Unsupported version of block log. Block log version is ${version} while code supports version(s) "
-             "[${min},${max}]",
-             ("version", version)("min", block_log::min_supported_version)("max", block_log::max_supported_version));
-
-         first_block_num = 1;
-         if (version != 1) {
-            ds.read((char*)&first_block_num, sizeof(first_block_num));
-         }
-
-         extractor(std::forward<Stream>(ds), *this);
-      }
-
-      template <typename Stream>
-      void read(Stream& ds) {
-         this->read(ds, [](auto& ds, block_log_preamble& preamble) { preamble.id = preamble.extract_chain_id(ds); });
-      }
-
-      fc::optional<genesis_state> extract_genesis_state(fc::datastream<const char*>&& ds) { 
-         fc::optional<genesis_state> result;
-         this->read(std::move(ds), [&result](auto&& ds, const block_log_preamble& preamble) {
-            if (block_log::contains_genesis_state(preamble.version, preamble.first_block_num)) {
-               genesis_state state;
-               fc::raw::unpack(ds, state);
-               preamble.validate_totem(ds);
-               result = state;
-            }
-          });
-         return result;
-      }
-
-      template <typename Stream,
-                class = typename std::enable_if<!std::is_lvalue_reference<Stream>::value>::type>
-      void read_and_ignore_context(Stream&& ds) {
-         this->read(std::move(ds), [](auto&& ds, const block_log_preamble& preamble) {});
-      }
-   };
 
    block_log::block_log(const fc::path& data_dir)
    :my(new detail::block_log_impl()) {
@@ -931,65 +925,24 @@ namespace eosio { namespace chain {
    }
 
    
-   detail::reverse_iterator::reverse_iterator()
-   : _file(nullptr, &fclose)
-   , _buffer_ptr(std::make_unique<char[]>(_buf_len)) {
+   detail::reverse_iterator::reverse_iterator() {
    }
 
    uint32_t detail::reverse_iterator::open(const fc::path& block_file_name) {
       _block_file_name = block_file_name.generic_string();
-      _file.reset( FC_FOPEN(_block_file_name.c_str(), "r"));
-      EOS_ASSERT( _file, block_log_exception, "Could not open Block log file at '${blocks_log}'", ("blocks_log", _block_file_name) );
-      _end_of_buffer_position = _unset_position;
-
-      // TODO: reimplemented with mapped_file_source and verify_log_preamble_and_return_version()
-
-      //read block log to see if version 1 or 2 and get first blocknum (implicit 1 if version 1)
-      _version = 0;
-      auto size = fread((char*)&_version, sizeof(_version), 1, _file.get());
-      EOS_ASSERT( size == 1, block_log_exception, "Block log file at '${blocks_log}' could not be read.", ("file", _block_file_name) );
-      EOS_ASSERT( block_log::is_supported_version(_version), block_log_unsupported_version,
-                  "block log version ${v} is not supported", ("v", _version));
-      if (_version == 1) {
-         _first_block_num = 1;
-      }
-      else {
-         size = fread((char*)&_first_block_num, sizeof(_first_block_num), 1, _file.get());
-         EOS_ASSERT( size == 1, block_log_exception, "Block log file at '${blocks_log}' not formatted consistently with version ${v}.", ("file", _block_file_name)("v", _version) );
-      }
-
-      auto status = fseek(_file.get(), 0, SEEK_END);
-      EOS_ASSERT( status == 0, block_log_exception, "Could not open Block log file at '${blocks_log}'. Returned status: ${status}", ("blocks_log", _block_file_name)("status", status) );
-
-      _eof_position_in_file = ftell(_file.get());
-      EOS_ASSERT( _eof_position_in_file > 0, block_log_exception, "Block log file at '${blocks_log}' could not be read.", ("blocks_log", _block_file_name) );
-      _current_position_in_file = _eof_position_in_file - _position_size;
-
-      update_buffer();
+      _log.open(_block_file_name);
+      _preamble.read_and_ignore_context(fc::datastream<const char*>(_log.data(), _log.size()));
 
       _blocks_found = 0;
-      char* buf = _buffer_ptr.get();
-      const uint32_t index_of_pos = _current_position_in_file - _start_of_buffer_position;
-      const uint64_t block_pos = *reinterpret_cast<uint64_t*>(buf + index_of_pos);
+      _current_position_in_file = _log.size() - sizeof(uint64_t);
+      const uint64_t block_pos  = read_buffer<uint64_t>(_log.data() + _current_position_in_file);
 
       if (block_pos == block_log::npos) {
          return 0;
       }
 
-      uint32_t bnum = 0;
-      if (block_pos >= _start_of_buffer_position) {
-         const uint32_t index_of_block = block_pos - _start_of_buffer_position;
-         bnum = *reinterpret_cast<uint32_t*>(buf + index_of_block + block_log_impl::blknum_offset_from_block_entry(_version));  //block number of previous block (is big endian)
-      }
-      else {
-         const auto blknum_offset_pos = block_pos + block_log_impl::blknum_offset_from_block_entry(_version);
-         auto status = fseek(_file.get(), blknum_offset_pos, SEEK_SET);
-         EOS_ASSERT( status == 0, block_log_exception, "Could not seek in '${blocks_log}' to position: ${pos}. Returned status: ${status}", ("blocks_log", _block_file_name)("pos", blknum_offset_pos)("status", status) );
-         auto size = fread((void*)&bnum, sizeof(bnum), 1, _file.get());
-         EOS_ASSERT( size == 1, block_log_exception, "Could not read in '${blocks_log}' at position: ${pos}", ("blocks_log", _block_file_name)("pos", blknum_offset_pos) );
-      }
-      _last_block_num = fc::endian_reverse_u32(bnum) + 1;                     //convert from big endian to little endian and add 1
-      _blocks_expected = _last_block_num - _first_block_num + 1;
+      _last_block_num = detail::block_log_impl::block_num_for_entry_at(_log.data() + block_pos, _preamble.version);                     //convert from big endian to little endian and add 1
+      _blocks_expected = _last_block_num - _preamble.first_block_num + 1;
       return _blocks_expected;
    }
 
@@ -998,18 +951,12 @@ namespace eosio { namespace chain {
                   block_log_exception,
                   "Block log file at '${blocks_log}' first block already returned by former call to previous(), it is no longer valid to call this function.", ("blocks_log", _block_file_name) );
 
-      if (_version == 1 && _blocks_found == _blocks_expected) {
+      if (_preamble.version == 1 && _blocks_found == _blocks_expected) {
          _current_position_in_file = block_log::npos;
          return _current_position_in_file;
       }
-	 
-      if (_start_of_buffer_position > _current_position_in_file) {
-         update_buffer();
-      }
 
-      char* buf = _buffer_ptr.get();
-      auto offset = _current_position_in_file - _start_of_buffer_position;
-      uint64_t block_location_in_file = *reinterpret_cast<uint64_t*>(buf + offset);
+      uint64_t block_location_in_file  = read_buffer<uint64_t>(_log.data() + _current_position_in_file);      
 
       ++_blocks_found;
       if (block_location_in_file == block_log::npos) {
@@ -1017,11 +964,11 @@ namespace eosio { namespace chain {
          EOS_ASSERT( _blocks_found != _blocks_expected,
                     block_log_exception,
                     "Block log file at '${blocks_log}' formatting indicated last block: ${last_block_num}, first block: ${first_block_num}, but found ${num} blocks",
-                    ("blocks_log", _block_file_name)("last_block_num", _last_block_num)("first_block_num", _first_block_num)("num", _blocks_found) );
+                    ("blocks_log", _block_file_name)("last_block_num", _last_block_num)("first_block_num", _preamble.first_block_num)("num", _blocks_found));
       }
       else {
          const uint64_t previous_position_in_file = _current_position_in_file;
-         _current_position_in_file = block_location_in_file - _position_size;
+         _current_position_in_file = block_location_in_file - sizeof(uint64_t);
          EOS_ASSERT( _current_position_in_file < previous_position_in_file,
                      block_log_exception,
                      "Block log file at '${blocks_log}' formatting is incorrect, indicates position later location in file: ${pos}, which was retrieved at: ${orig_pos}.",
@@ -1031,24 +978,6 @@ namespace eosio { namespace chain {
       return block_location_in_file;
    }
 
-   void detail::reverse_iterator::update_buffer() {
-      EOS_ASSERT( _current_position_in_file != block_log::npos, block_log_exception, "Block log file not setup properly" );
-
-      // since we need to read in a new section, just need to ensure the next position is at the very end of the buffer
-      _end_of_buffer_position = _current_position_in_file + _position_size;
-      if (_end_of_buffer_position < _buf_len) {
-         _start_of_buffer_position = 0;
-      }
-      else {
-         _start_of_buffer_position = _end_of_buffer_position - _buf_len;
-      }
-
-      auto status = fseek(_file.get(), _start_of_buffer_position, SEEK_SET);
-      EOS_ASSERT( status == 0, block_log_exception, "Could not seek in '${blocks_log}' to position: ${pos}. Returned status: ${status}", ("blocks_log", _block_file_name)("pos", _start_of_buffer_position)("status", status) );
-      char* buf = _buffer_ptr.get();
-      auto size = fread((void*)buf, (_end_of_buffer_position - _start_of_buffer_position), 1, _file.get());//read tail of blocks.log file into buf
-      EOS_ASSERT( size == 1, block_log_exception, "blocks.log read fails" );
-   }
 
    detail::index_writer::index_writer(const fc::path& block_index_name, uint32_t blocks_expected)
    : _file(nullptr, &fclose)
@@ -1194,9 +1123,9 @@ namespace eosio { namespace chain {
       // ****** end of new block log header
 
       // copy over remainder of block log to new block log
-      auto buffer =  std::make_unique<char[]>(detail::reverse_iterator::_buf_len);
+      const uint32_t buf_len = 1U << 24;
+      auto buffer =  std::make_unique<char[]>(buf_len);
       char* buf =  buffer.get();
-
 
       // offset bytes to shift from old blocklog position to new blocklog position
       const uint64_t original_file_block_pos = original_block_log.block_pos(truncate_at_block);
@@ -1217,8 +1146,8 @@ namespace eosio { namespace chain {
       uint64_t read_size = 0;
       for(uint64_t to_write_remaining = to_write; to_write_remaining > 0; to_write_remaining -= read_size) {
          read_size = to_write_remaining;
-         if (read_size > detail::reverse_iterator::_buf_len) {
-            read_size = detail::reverse_iterator::_buf_len;
+         if (read_size > buf_len) {
+            read_size = buf_len;
          }
 
          // read in the previous contiguous memory into the read buffer
