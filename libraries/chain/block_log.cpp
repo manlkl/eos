@@ -296,55 +296,10 @@ namespace eosio { namespace chain {
       public:
          index_writer(const fc::path& block_index_name, uint32_t blocks_expected);
          void write(uint64_t pos);
-         void complete();
-         void update_buffer_position();
-         constexpr static uint64_t          _buffer_bytes             = 1U << 22;
+         void close() { index.close(); }
       private:
-         void prepare_buffer();
-         bool shift_buffer();
-
-         unique_file                        _file;
-         const std::string                  _block_index_name;
-         const uint32_t                     _blocks_expected;
-         uint32_t                           _block_written;
-         std::unique_ptr<uint64_t[]>        _buffer_ptr;
-         int64_t                            _current_position         = 0;
-         int64_t                            _start_of_buffer_position = 0;
-         int64_t                            _end_of_buffer_position   = 0;
-         constexpr static uint64_t          _max_buffer_length        = file_location_to_buffer_location(_buffer_bytes);
-      };
-
-      /*
-       *  @brief datastream adapter that adapts FILE* for use with fc unpack
-       *
-       *  This class supports unpack functionality but not pack.
-       */
-      class fileptr_datastream {
-      public:
-         explicit fileptr_datastream( FILE* file, const std::string& filename ) : _file(file), _filename(filename) {}
-
-         void skip( size_t s ) {
-            auto status = fseek(_file, s, SEEK_CUR);
-            EOS_ASSERT( status == 0, block_log_exception,
-                        "Could not seek past ${bytes} bytes in Block log file at '${blocks_log}'. Returned status: ${status}",
-                        ("bytes", s)("blocks_log", _filename)("status", status) );
-         }
-
-         bool read( char* d, size_t s ) {
-            size_t result = fread( d, 1, s, _file );
-            EOS_ASSERT( result == s, block_log_exception,
-                        "only able to read ${act} bytes of the expected ${exp} bytes in file: ${file}",
-                        ("act",result)("exp",s)("file", _filename) );
-            return true;
-         }
-
-         bool get( unsigned char& c ) { return get( *(char*)&c ); }
-
-         bool get( char& c ) { return read(&c, 1); }
-
-      private:
-         FILE* const _file;
-         const std::string _filename;
+         boost::iostreams::mapped_file_sink index;
+         uint64_t                           current_position = 0;
       };
 }}} // namespace eosio::chain::detail
 
@@ -700,7 +655,7 @@ namespace eosio { namespace chain {
       while ((position = block_log_iter.previous()) != npos) {
          index.write(position);
       }
-      index.complete();
+      index.close();
    }
 
 
@@ -959,76 +914,19 @@ namespace eosio { namespace chain {
 
 
    detail::index_writer::index_writer(const fc::path& block_index_name, uint32_t blocks_expected)
-   : _file(nullptr, &fclose)
-   , _block_index_name(block_index_name.generic_string())
-   , _blocks_expected(blocks_expected)
-   , _block_written(blocks_expected)
-   , _buffer_ptr(std::make_unique<uint64_t[]>(_max_buffer_length)) {
+   : current_position(blocks_expected * sizeof(uint64_t)){
+      using namespace boost::iostreams;
+      mapped_file_params params(block_index_name.generic_string());
+      params.flags = mapped_file::readwrite;
+      params.new_file_size = current_position;
+      params.length = current_position;
+      params.offset = 0;
+      index.open(params);
    }
 
    void detail::index_writer::write(uint64_t pos) {
-      prepare_buffer();
-      uint64_t* buffer = _buffer_ptr.get();
-      buffer[_current_position - _start_of_buffer_position] = pos;
-      --_current_position;
-      if ((_block_written & 0xfffff) == 0) {                            //periodically print a progress indicator
-         ilog("block: ${block_written}      position in file: ${pos}", ("block_written", _block_written)("pos",pos));
-      }
-      --_block_written;
-   }
-
-   void detail::index_writer::prepare_buffer() {
-      if (_file == nullptr) {
-         _file.reset(FC_FOPEN(_block_index_name.c_str(), "w"));
-         EOS_ASSERT( _file, block_log_exception, "Could not open Block index file at '${blocks_index}'", ("blocks_index", _block_index_name) );
-         // allocate 8 bytes for each block position to store
-         const auto full_file_size = buffer_location_to_file_location(_blocks_expected);
-         auto status = fseek(_file.get(), full_file_size, SEEK_SET);
-         EOS_ASSERT( status == 0, block_log_exception, "Could not allocate in '${blocks_index}' storage for all the blocks, size: ${size}. Returned status: ${status}", ("blocks_index", _block_index_name)("size", full_file_size)("status", status) );
-         const auto block_end = file_location_to_buffer_location(full_file_size);
-         _current_position = block_end - 1;
-         update_buffer_position();
-      }
-
-      shift_buffer();
-   }
-
-   bool detail::index_writer::shift_buffer() {
-      if (_current_position >= _start_of_buffer_position) {
-         return false;
-      }
-
-      const auto file_location_start = buffer_location_to_file_location(_start_of_buffer_position);
-
-      auto status = fseek(_file.get(), file_location_start, SEEK_SET);
-      EOS_ASSERT( status == 0, block_log_exception, "Could not navigate in '${blocks_index}' file_location_start: ${loc}, _start_of_buffer_position: ${_start_of_buffer_position}. Returned status: ${status}", ("blocks_index", _block_index_name)("loc", file_location_start)("_start_of_buffer_position",_start_of_buffer_position)("status", status) );
-
-      const auto buffer_size = _end_of_buffer_position - _start_of_buffer_position;
-      const auto file_size = buffer_location_to_file_location(buffer_size);
-      uint64_t* buf = _buffer_ptr.get();
-      auto size = fwrite((void*)buf, file_size, 1, _file.get());
-      EOS_ASSERT( size == 1, block_log_exception, "Writing Block Index file '${file}' failed at location: ${loc}", ("file", _block_index_name)("loc", file_location_start) );
-      update_buffer_position();
-      return true;
-   }
-
-   void detail::index_writer::complete() {
-      const bool shifted = shift_buffer();
-      EOS_ASSERT(shifted, block_log_exception, "Failed to write buffer to '${blocks_index}'", ("blocks_index", _block_index_name) );
-      EOS_ASSERT(_current_position == -1,
-                 block_log_exception,
-                 "Should have written buffer, starting at the 0 index block position, to '${blocks_index}' but instead writing ${pos} position",
-                 ("blocks_index", _block_index_name)("pos", _current_position) );
-   }
-
-   void detail::index_writer::update_buffer_position() {
-      _end_of_buffer_position = _current_position + 1;
-      if (_end_of_buffer_position < _max_buffer_length) {
-         _start_of_buffer_position = 0;
-      }
-      else {
-         _start_of_buffer_position = _end_of_buffer_position - _max_buffer_length;
-      }
+      current_position -= sizeof(pos);
+      memcpy(index.data() + current_position, &pos, sizeof(pos));
    }
 
    bool block_log::contains_genesis_state(uint32_t version, uint32_t first_block_num) {
@@ -1146,7 +1044,7 @@ namespace eosio { namespace chain {
          new_block_file.seek(new_block_file_first_block_pos + to_write_remaining - read_size);
          new_block_file.write(buf, read_size);
       }
-      index.complete();
+      index.close();
       new_block_file.flush();
       new_block_file.close();
 
