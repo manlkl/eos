@@ -8,6 +8,7 @@
 #include <boost/filesystem.hpp>
 #include <variant>
 #include <algorithm>
+#include <variant>
 
 #define LOG_READ  (std::ios::in | std::ios::binary)
 #define LOG_WRITE (std::ios::out | std::ios::binary | std::ios::app)
@@ -47,17 +48,47 @@ namespace eosio { namespace chain {
       return result;
    }
 
-
    struct block_log_preamble {
       uint32_t version         = 0;
       uint32_t first_block_num = 0;
-      chain_id_type id;
+      std::variant<genesis_state, chain_id_type> chain_context;
+
+      chain_id_type chain_id() const {
+         return std::visit(overloaded{[](const chain_id_type& id) { return id; },
+                                      [](const genesis_state& state) { return state.compute_chain_id(); }},
+                           chain_context);
+      }
 
       constexpr static int without_genesis_state_size =
-          sizeof(version) + sizeof(first_block_num) + sizeof(id) + sizeof(block_log::npos);
+          sizeof(version) + sizeof(first_block_num) + sizeof(chain_id_type) + sizeof(block_log::npos);
 
-      template <typename Stream>
-      void validate_totem(Stream& ds) const {
+      void read(fc::datastream<const char*>& ds) {
+        ds.read((char*)&version, sizeof(version));
+         EOS_ASSERT(version > 0, block_log_exception, "Block log was not setup properly");
+         EOS_ASSERT(
+             block_log::is_supported_version(version), block_log_unsupported_version,
+             "Unsupported version of block log. Block log version is ${version} while code supports version(s) "
+             "[${min},${max}]",
+             ("version", version)("min", block_log::min_supported_version)("max", block_log::max_supported_version));
+
+         first_block_num = 1;
+         if (version != 1) {
+            ds.read((char*)&first_block_num, sizeof(first_block_num));
+         }
+
+         if (block_log::contains_genesis_state(version, first_block_num)) {
+            chain_context = genesis_state{};
+            fc::raw::unpack(ds, std::get<genesis_state>(chain_context));
+         } else if (block_log::contains_chain_id(version, first_block_num)) {
+            chain_context = chain_id_type{};
+            ds >> std::get<chain_id_type>(chain_context);
+         } else {
+            EOS_THROW(block_log_exception,
+                      "Block log is not supported. version: ${ver} and first_block_num: ${fbn} does not contain "
+                      "a genesis_state nor a chain_id.",
+                      ("ver", version)("fbn", first_block_num));
+         }
+
          if (version != 1) {
             auto                                    expected_totem = block_log::npos;
             std::decay_t<decltype(block_log::npos)> actual_totem;
@@ -72,74 +103,19 @@ namespace eosio { namespace chain {
       }
 
       template <typename Stream>
-      chain_id_type extract_chain_id(Stream& ds) const {
-         chain_id_type chain_id;
-         if (block_log::contains_genesis_state(version, first_block_num)) {
-            genesis_state state;
-            fc::raw::unpack(ds, state);
-            chain_id = state.compute_chain_id();
-         } else if (block_log::contains_chain_id(version, first_block_num)) {
-            ds >> chain_id;
-         } else {
-            EOS_THROW(block_log_exception,
-                      "Block log is not supported. version: ${ver} and first_block_num: ${fbn} does not contain "
-                      "a genesis_state nor a chain_id.",
-                      ("ver", version)("fbn", first_block_num));
-         }
-
-         validate_totem(ds);
-         return chain_id;
-      }
-
-      template <typename Stream, typename ContextExtractor>
-      void read(Stream&& ds, ContextExtractor&& extractor) {
-
-         ds.read((char*)&version, sizeof(version));
-         EOS_ASSERT(version > 0, block_log_exception, "Block log was not setup properly");
-         EOS_ASSERT(
-             block_log::is_supported_version(version), block_log_unsupported_version,
-             "Unsupported version of block log. Block log version is ${version} while code supports version(s) "
-             "[${min},${max}]",
-             ("version", version)("min", block_log::min_supported_version)("max", block_log::max_supported_version));
-
-         first_block_num = 1;
-         if (version != 1) {
-            ds.read((char*)&first_block_num, sizeof(first_block_num));
-         }
-
-         extractor(std::forward<Stream>(ds), *this);
-      }
-
-      template <typename Stream>
-      void read(Stream& ds) {
-         this->read(ds, [](auto& ds, block_log_preamble& preamble) { preamble.id = preamble.extract_chain_id(ds); });
-      }
-
-      fc::optional<genesis_state> extract_genesis_state(fc::datastream<const char*>&& ds) { 
-         fc::optional<genesis_state> result;
-         this->read(std::move(ds), [&result](auto&& ds, const block_log_preamble& preamble) {
-            if (block_log::contains_genesis_state(preamble.version, preamble.first_block_num)) {
-               genesis_state state;
-               fc::raw::unpack(ds, state);
-               preamble.validate_totem(ds);
-               result = state;
-            }
-          });
-         return result;
-      }
-
-      template <typename Stream>
-      void read_and_ignore_context(Stream& ds) {
-         this->read(ds, [](auto&& ds, const block_log_preamble& preamble) {});
-      }
-
-      template <typename Stream>
       void write(Stream& ds) const {
-         EOS_ASSERT(version >= 2 && first_block_num > 1, block_log_exception, 
-                   "this method does not support writeing block log ${version} with first_block_num < 2", ("version", version));
+         EOS_ASSERT(version >= 2, block_log_exception, "this method does not support writeing block log ${version}",
+                    ("version", version));
          ds.write(reinterpret_cast<const char*>(&version), sizeof(version));
          ds.write(reinterpret_cast<const char*>(&first_block_num), sizeof(first_block_num));
-         ds << id;
+
+         std::visit(overloaded{[&ds](const chain_id_type& id) { ds << id; },
+                               [&ds](const genesis_state& state) {
+                                  auto data = fc::raw::pack(state);
+                                  ds.write(data.data(), data.size());
+                               }},
+                    chain_context);
+
          auto totem = block_log::npos;
          ds.write(reinterpret_cast<const char*>(&totem), sizeof(totem));
       }
@@ -232,12 +208,7 @@ namespace eosio { namespace chain {
                open_files = false;
             }
 
-            template<typename T>
-            void reset( const T& t, const pruned_block_ptr& first_block, pruned_transaction::cf_compression_type segment_compression, uint32_t first_block_num );
-
-            void write( const genesis_state& gs );
-
-            void write( const chain_id_type& chain_id );
+            void reset( const pruned_block_ptr& first_block, pruned_transaction::cf_compression_type segment_compression, uint32_t first_block_num );
 
             void flush();
 
@@ -248,27 +219,7 @@ namespace eosio { namespace chain {
 
             void                          read_block_header(block_header& bh, uint64_t file_pos);
             std::unique_ptr<pruned_block> read_block(uint64_t pos);
-            void                          read_head();
-
-            
-
-            static int blknum_offset_from_block_entry(uint32_t block_log_version) { 
-
-               //to derive blknum_offset==14 see block_header.hpp and note on disk struct is packed
-               //   block_timestamp_type timestamp;                  //bytes 0:3
-               //   account_name         producer;                   //bytes 4:11
-               //   uint16_t             confirmed;                  //bytes 12:13
-               //   block_id_type        previous;                   //bytes 14:45, low 4 bytes is big endian block number of previous block
-               
-               int blknum_offset = 14;
-               blknum_offset += offset_to_block_start(block_log_version);
-               return blknum_offset;
-            }
-
-            static uint32_t block_num_for_entry_at(const char* addr, uint32_t version) { 
-               uint32_t prev_block_num = read_buffer<uint32_t>(addr + blknum_offset_from_block_entry(version));
-               return fc::endian_reverse_u32(prev_block_num) + 1;
-            }
+            void                          read_head();            
       };
 
       void detail::block_log_impl::reopen() {
@@ -341,10 +292,25 @@ namespace eosio { namespace chain {
       uint64_t      size() const { return file.size(); }
       uint32_t      version() const { return preamble.version; }
       uint32_t      first_block_num() const { return preamble.first_block_num; }
-      chain_id_type chain_id() const { return preamble.id; }
+      chain_id_type chain_id() const { return preamble.chain_id(); }
+
+      fc::optional<genesis_state> get_genesis_state() const {
+         return std::visit(overloaded{[](const chain_id_type&) { return fc::optional<genesis_state>{}; },
+                                      [](const genesis_state& state) { return fc::optional<genesis_state>{state}; }},
+                           preamble.chain_context);
+      }
 
       uint32_t block_num_at(uint64_t position) const {
-         return detail::block_log_impl::block_num_for_entry_at(data() + position, version());
+         //to derive blknum_offset==14 see block_header.hpp and note on disk struct is packed
+         //   block_timestamp_type timestamp;                  //bytes 0:3
+         //   account_name         producer;                   //bytes 4:11
+         //   uint16_t             confirmed;                  //bytes 12:13
+         //   block_id_type        previous;                   //bytes 14:45, low 4 bytes is big endian block number of previous block
+         
+         int blknum_offset = 14;
+         blknum_offset += offset_to_block_start(version());
+         uint32_t prev_block_num = read_buffer<uint32_t>(data() + position + blknum_offset);
+         return fc::endian_reverse_u32(prev_block_num) + 1;
       }
 
       uint32_t last_block_num() const { 
@@ -359,8 +325,6 @@ namespace eosio { namespace chain {
 
       uint64_t first_block_position() const { return first_block_pos;  }
       uint64_t last_block_position() const { return read_buffer<uint64_t>(data() + size() - sizeof(uint64_t)); }
-
-      
    };
 
    class block_log_index {
@@ -593,8 +557,7 @@ namespace eosio { namespace chain {
       index_file.flush();
    }
 
-   template<typename T>
-   void detail::block_log_impl::reset( const T& t, const pruned_block_ptr& first_block, pruned_transaction::cf_compression_type segment_compression, uint32_t first_bnum ) {
+   void detail::block_log_impl::reset( const pruned_block_ptr& first_block, pruned_transaction::cf_compression_type segment_compression, uint32_t first_bnum ) {
       close();
 
       fc::remove_all( block_file.get_file_path() );
@@ -602,62 +565,38 @@ namespace eosio { namespace chain {
 
       reopen();
 
-      preamble.version = 0; // version of 0 is invalid; it indicates that subsequent data was not properly written to the block log
+      preamble.version = block_log::max_supported_version; // version of 0 is invalid; it indicates that subsequent data was not properly written to the block log
       preamble.first_block_num = first_bnum;
+      preamble.write(block_file);
 
-      block_file.seek_end(0);
-      block_file.write((char*)&preamble.version, sizeof(preamble.version));
-      block_file.write((char*)&preamble.first_block_num, sizeof(preamble.first_block_num));
-
-      write(t);
       genesis_written_to_block_log = true;
-
-      // append a totem to indicate the division between blocks and header
-      auto totem = block_log::npos;
-      block_file.write((char*)&totem, sizeof(totem));
-
-      // version must be assigned before this->append() because it is used inside this->append()
-      preamble.version = block_log::max_supported_version;
-
+      
       if (first_block) {
          append(first_block, segment_compression);
       } else {
          head.reset();
       }
 
-      auto pos = block_file.tellp();
-
       static_assert( block_log::max_supported_version > 0, "a version number of zero is not supported" );
-
-      // going back to write correct version to indicate that all block log header data writes completed successfully
-      block_file.seek( 0 );
-      block_file.write( (char*)&preamble.version, sizeof(preamble.version) );
-      block_file.seek( pos );
       flush();
    }
 
    void block_log::reset( const genesis_state& gs, const signed_block_ptr& first_block ) {
       auto b = std::make_shared<pruned_block>(*first_block,true);
-      my->reset(gs, b, pruned_transaction::cf_compression_type::none, 1);
+      my->preamble.chain_context = gs;
+      my->reset(b, pruned_transaction::cf_compression_type::none, 1);
    }
 
    void block_log::reset( const genesis_state& gs, const pruned_block_ptr& first_block, pruned_transaction::cf_compression_type segment_compression ) {
-      my->reset(gs, first_block,segment_compression, 1);
+      my->preamble.chain_context = gs;
+      my->reset(first_block,segment_compression, 1);
    }
 
    void block_log::reset( const chain_id_type& chain_id, uint32_t first_block_num ) {
       EOS_ASSERT( first_block_num > 1, block_log_exception,
                   "Block log version ${ver} needs to be created with a genesis state if starting from block number 1." );
-      my->reset(chain_id, pruned_block_ptr(), pruned_transaction::cf_compression_type::none, first_block_num);
-   }
-
-   void detail::block_log_impl::write( const genesis_state& gs ) {
-      auto data = fc::raw::pack(gs);
-      block_file.write(data.data(), data.size());
-   }
-
-   void detail::block_log_impl::write( const chain_id_type& chain_id ) {
-      block_file << chain_id;
+      my->preamble.chain_context = chain_id;
+      my->reset(pruned_block_ptr(), pruned_transaction::cf_compression_type::none, first_block_num);
    }
 
    std::unique_ptr<pruned_block> detail::block_log_impl::read_block(uint64_t pos) {
@@ -947,10 +886,9 @@ namespace eosio { namespace chain {
    }
 
    fc::optional<genesis_state> block_log::extract_genesis_state( const fc::path& data_dir ) {
-      boost::iostreams::mapped_file_source log( (data_dir / "blocks.log").generic_string() );
-      block_log_preamble                   preamble;
-      return preamble.extract_genesis_state(fc::datastream<const char*>(log.data(), log.size()));
+      return block_log_data(data_dir / "blocks.log").get_genesis_state();
    }
+      
 
    chain_id_type block_log::extract_chain_id( const fc::path& data_dir ) {
       return block_log_data(data_dir / "blocks.log").chain_id();
@@ -1052,7 +990,7 @@ namespace eosio { namespace chain {
       block_log_preamble preamble;
       preamble.version         = block_log::max_supported_version;
       preamble.first_block_num = truncate_at_block;
-      preamble.id              = archive.log_data.chain_id();
+      preamble.chain_context              = archive.log_data.chain_id();
       preamble.write(ds);
 
       memcpy(new_block_file.data() + block_log_preamble::without_genesis_state_size, archive.log_data.data() + original_file_block_pos, to_write);
